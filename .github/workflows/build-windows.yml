@@ -1,0 +1,43 @@
+name: Build Windows firmware
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Apply the Windows patch
+        run: |
+          if git apply --check windows-ble-hid.patch 2>/dev/null; then
+            git apply windows-ble-hid.patch
+          else
+            echo "Patch does not apply cleanly - checking whether it is already applied."
+            grep -q openremote_rev5_windows remote/platformio.ini
+          fi
+
+      - name: Build
+        working-directory: remote
+        run: pio run -e openremote_rev5_windows
+
+      - name: Collect the files needed to flash
+        run: |
+          B=remote/.pio/build/openremote_rev5_windows
+          mkdir out
+          cp "$B/firmware.bin" "$B/bootloader.bin" "$B/partitions.bin" out/
+          cp "$(find ~/.platformio -name boot_app0.bin | head -1)" out/
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenRemote-6.12-windows
+          path: out/
