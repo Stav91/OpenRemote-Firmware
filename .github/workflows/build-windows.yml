@@ -14,7 +14,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install PlatformIO
-        run: pip install platformio
+        # Pinned: PlatformIO 6.2.0 wants a newer SCons tool package than the
+        # ESP32 platform declares, and the mismatch breaks the link step with
+        # "No module named 'SCons.Tool.FortranCommon'".
+        run: pip install "platformio==6.1.19"
 
       - name: Apply the Windows patch
         run: |
