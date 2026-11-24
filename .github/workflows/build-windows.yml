@@ -3,9 +3,17 @@ name: Build Windows firmware
 on:
   workflow_dispatch:
 
+# Two independent attempts run side by side. Plain PlatformIO fails at the final
+# link step with "No module named 'SCons.Tool.FortranCommon'" (a build-tool
+# version mismatch with the pioarduino ESP32 platform). Whichever attempt
+# succeeds uploads the firmware.
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [pioarduino-core, patched-platform]
     steps:
       - uses: actions/checkout@v4
 
@@ -13,11 +21,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PlatformIO
-        # Pinned: PlatformIO 6.2.0 wants a newer SCons tool package than the
-        # ESP32 platform declares, and the mismatch breaks the link step with
-        # "No module named 'SCons.Tool.FortranCommon'".
-        run: pip install "platformio==6.1.19"
+      - name: Install the pioarduino build tool
+        if: matrix.variant == 'pioarduino-core'
+        run: pip install pioarduino
+
+      - name: Install PlatformIO and patch the platform's SCons version
+        if: matrix.variant == 'patched-platform'
+        run: |
+          pip install platformio
+          python -m platformio pkg install -g -p "https://github.com/pioarduino/platform-espressif32/releases/download/55.03.311/platform-espressif32.zip"
+          P=$(find ~/.platformio/platforms -maxdepth 2 -name platform.json | head -1)
+          echo "Patching $P"
+          grep -n scons "$P"
+          sed -i 's/4\.40801\.0/4.41101.0/' "$P"
+          grep -n scons "$P"
+
+      - name: Show tool version
+        run: python -m platformio --version
 
       - name: Apply the Windows patch
         run: |
@@ -30,17 +50,26 @@ jobs:
 
       - name: Build
         working-directory: remote
-        run: pio run -e openremote_rev5_windows
+        run: python -m platformio run -e openremote_rev5_windows
 
       - name: Collect the files needed to flash
         run: |
-          B=remote/.pio/build/openremote_rev5_windows
+          FW=$(find remote -name firmware.bin -path '*openremote_rev5_windows*' | head -1)
+          B=$(dirname "$FW")
+          BOOT=$(find "$HOME" -name boot_app0.bin 2>/dev/null | head -1)
+          test -n "$FW" && test -n "$BOOT"
           mkdir out
-          cp "$B/firmware.bin" "$B/bootloader.bin" "$B/partitions.bin" out/
-          cp "$(find ~/.platformio -name boot_app0.bin | head -1)" out/
+          cp "$FW" "$B/bootloader.bin" "$B/partitions.bin" "$BOOT" out/
           ls -l out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: OpenRemote-6.12-windows
+          name: OpenRemote-6.12-windows-${{ matrix.variant }}
           path: out/
+
+      - name: Diagnostics (only runs if something failed)
+        if: failure()
+        run: |
+          pip list 2>/dev/null | grep -i -E "platformio|pioarduino|scons" || true
+          ls -la ~/.platformio/packages 2>&1 | head -40 || true
+          grep -rn scons ~/.platformio/platforms/*/platform.json 2>&1 | head || true
