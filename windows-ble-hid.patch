@@ -1,0 +1,226 @@
+diff --git a/remote/OpenRemote_1.0.ino b/remote/OpenRemote_1.0.ino
+index f59df2a..39abeb2 100644
+--- a/remote/OpenRemote_1.0.ino
++++ b/remote/OpenRemote_1.0.ino
+@@ -8209,6 +8209,60 @@ static const BluetoothPresetCommand CHROMECAST_COMMANDS[] = {
+ static const uint8_t CHROMECAST_COMMAND_COUNT =
+   sizeof(CHROMECAST_COMMANDS) / sizeof(CHROMECAST_COMMANDS[0]);
+ 
++#if defined(OPENREMOTE_BLE_WINDOWS_HID)
++/*
++  Windows build (env:openremote_rev5_windows) - one top-level collection.
++
++  The Android TV map below declares TWO top-level collections, Keyboard and
++  Consumer Control, that both use Report ID 1. Android's HID parser lays the
++  fields of one report ID out back to back, so it sees a single 10-byte report
++  and is happy. Windows is not: it builds a separate device per top-level
++  collection and routes reports to it by Report ID, so two collections sharing
++  one ID is an invalid descriptor. Pairing succeeds, the link stays up for a
++  second while Windows reads the descriptor, then the HID driver fails to start
++  ("driver error").
++
++  The Report characteristic is a single 10-byte report that cannot be split in
++  two: the Arduino-ESP32 3.3.x NimBLE wrapper drops a second characteristic with
++  the same UUID (BLEService::addCharacteristic is keyed by UUID), which is the
++  panic described in changelog 1.74. So the two collections are merged into one
++  instead. The report is byte-for-byte what it was: modifier, reserved, six key
++  codes, then one 16-bit Consumer usage - 10 bytes, Report ID 1.
++
++  The key array runs to 0x81 rather than 0x65 so that Keyboard Mute / Volume Up /
++  Volume Down (0x7F-0x81) can be sent as ordinary keyboard keys, which Windows
++  acts on. Logical Maximum is written as a 2-byte item (0x26 0x81 0x00): a 1-byte
++  0x81 is signed, reads as -127, and a Logical Maximum below the Logical Minimum
++  is rejected by Windows' parser.
++*/
++static const uint8_t BLE_HID_REPORT_MAP[] = {
++  0x05, 0x01,              // Usage Page (Generic Desktop)
++  0x09, 0x06,              // Usage (Keyboard)
++  0xA1, 0x01,              // Collection (Application)
++  0x85, 0x01,              //   Report ID (1)
++  0x05, 0x07,              //   Usage Page (Keyboard/Keypad)
++  0x19, 0xE0, 0x29, 0xE7,  //   Usage Minimum (Left Ctrl), Maximum (Right GUI)
++  0x15, 0x00, 0x25, 0x01,  //   Logical Minimum (0), Maximum (1)
++  0x75, 0x01, 0x95, 0x08,  //   Report Size (1), Report Count (8)
++  0x81, 0x02,              //   Input (Data, Variable, Absolute) - modifiers
++  0x95, 0x01, 0x75, 0x08,  //   Report Count (1), Report Size (8)
++  0x81, 0x01,              //   Input (Constant) - reserved byte
++  0x95, 0x06, 0x75, 0x08,  //   Report Count (6), Report Size (8)
++  0x15, 0x00,              //   Logical Minimum (0)
++  0x26, 0x81, 0x00,        //   Logical Maximum (129)
++  0x05, 0x07,              //   Usage Page (Keyboard/Keypad)
++  0x19, 0x00, 0x29, 0x81,  //   Usage Minimum (0), Maximum (0x81)
++  0x81, 0x00,              //   Input (Data, Array) - six key codes
++  0x05, 0x0C,              //   Usage Page (Consumer)
++  0x15, 0x00,              //   Logical Minimum (0)
++  0x26, 0xFF, 0x03,        //   Logical Maximum (1023)
++  0x19, 0x00,              //   Usage Minimum (0)
++  0x2A, 0xFF, 0x03,        //   Usage Maximum (0x3FF)
++  0x75, 0x10, 0x95, 0x01,  //   Report Size (16), Report Count (1)
++  0x81, 0x00,              //   Input (Data, Array) - one consumer usage
++  0xC0                     // End Collection
++};
++#else
+ static const uint8_t BLE_HID_REPORT_MAP[] = {
+   0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,
+   0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
+@@ -8222,6 +8276,7 @@ static const uint8_t BLE_HID_REPORT_MAP[] = {
+   0xFF, 0x03, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
+   0xC0
+ };
++#endif
+ static const uint8_t BLE_HID_INPUT_BYTES = 10;
+ 
+ static const uint8_t DISPLAY_MODULE_ADAFRUIT = 0;
+@@ -16082,6 +16137,15 @@ void applyBluetoothState() {
+     // without recreating the duplicate characteristic that caused the panic.
+     bleKeyboardInput = bleHid->inputReport(1);
+     bleConsumerInput = bleKeyboardInput;
++#if defined(OPENREMOTE_BLE_WINDOWS_HID)
++    // Windows reads the Report characteristic while it sets the device up. With
++    // no value set that read returns zero bytes, where the descriptor promises
++    // a 10-byte report. Start it as an all-keys-released report.
++    {
++      static const uint8_t idleReport[BLE_HID_INPUT_BYTES] = {0};
++      bleKeyboardInput->setValue(idleReport, sizeof(idleReport));
++    }
++#endif
+     bool atvvReady = setupAtvvService(bleServer);
+     float batteryPercent = readBatteryPercent();
+     bleHid->setBatteryLevel(batteryPercent >= 0.0f
+@@ -19358,6 +19422,28 @@ uint16_t legacyKeyboardUsageToConsumer(uint16_t usage) {
+   }
+ }
+ 
++#if defined(OPENREMOTE_BLE_WINDOWS_HID)
++// Android TV navigation is sent as Consumer Control "menu" usages, which
++// Windows does not act on. Returns the standard keyboard usage that does the
++// same job on a PC, or 0 when there is no equivalent and the usage should go
++// out as Consumer Control unchanged (play/pause, next, etc.).
++uint8_t windowsKeyboardUsageForConsumer(uint16_t usage) {
++  switch (usage) {
++    case 0x0042: return 0x52;  // Menu Up      -> Up Arrow
++    case 0x0043: return 0x51;  // Menu Down    -> Down Arrow
++    case 0x0044: return 0x50;  // Menu Left    -> Left Arrow
++    case 0x0045: return 0x4F;  // Menu Right   -> Right Arrow
++    case 0x0041: return 0x28;  // Menu Select  -> Enter
++    case 0x0224: return 0x29;  // AC Back      -> Escape
++    case 0x0223: return 0x4A;  // AC Home      -> Home
++    case 0x00E9: return 0x80;  // Volume Up    -> Keyboard Volume Up
++    case 0x00EA: return 0x81;  // Volume Down  -> Keyboard Volume Down
++    case 0x00E2: return 0x7F;  // Mute         -> Keyboard Mute
++    default: return 0;
++  }
++}
++#endif
++
+ bool isVoiceSearchCommand(const DeviceCommand *command) {
+   return command && command->kind == DeviceCommand::BLE_HID &&
+     (strcmp(command->id, "ble_voice_search") == 0 ||
+@@ -19368,6 +19454,25 @@ bool sendBleHidState(const DeviceCommand &command, bool pressed) {
+   if (!bleConsumerInput ||
+       (command.hidReport != 1 && command.hidReport != 2)) return false;
+   uint8_t report[BLE_HID_INPUT_BYTES] = {0};
++#if defined(OPENREMOTE_BLE_WINDOWS_HID)
++  // Windows build: real keyboard keys wherever Windows has an equivalent, no
++  // Android navigation remap. Layout is unchanged - [0] modifiers, [1]
++  // reserved, [2..7] key codes, [8..9] one Consumer usage.
++  if (pressed) {
++    if (command.hidReport == 1) {
++      if (command.hidUsage > 0xFF) return false;
++      report[2] = (uint8_t)command.hidUsage;
++    } else {
++      uint8_t key = windowsKeyboardUsageForConsumer(command.hidUsage);
++      if (key) {
++        report[2] = key;
++      } else {
++        report[8] = (uint8_t)(command.hidUsage & 0xFF);
++        report[9] = (uint8_t)(command.hidUsage >> 8);
++      }
++    }
++  }
++#else
+   if (pressed) {
+     if (command.hidReport == 1) {
+       uint16_t consumerUsage = legacyKeyboardUsageToConsumer(command.hidUsage);
+@@ -19384,6 +19489,7 @@ bool sendBleHidState(const DeviceCommand &command, bool pressed) {
+       report[9] = (uint8_t)(command.hidUsage >> 8);
+     }
+   }
++#endif
+   bleConsumerInput->setValue(report, sizeof(report));
+   bleConsumerInput->notify();
+   return true;
+diff --git a/remote/PLATFORMIO.md b/remote/PLATFORMIO.md
+index e34372e..f382525 100644
+--- a/remote/PLATFORMIO.md
++++ b/remote/PLATFORMIO.md
+@@ -24,9 +24,13 @@ The project is configured for the OMOTE Rev5 ESP32-S3 N16R8 hardware:
+ The libraries are pinned in `platformio.ini`. PlatformIO installs them into the
+ project automatically; Arduino IDE's global library folder is not used.
+ 
+-The single `openremote_rev5` environment is the tested release target. Its
+-pinned ESP32 framework already includes tickless scheduling and Bluetooth
+-controller modem sleep; no experimental SDK configuration is required.
++The `openremote_rev5` environment is the tested release target. Its pinned
++ESP32 framework already includes tickless scheduling and Bluetooth controller
++modem sleep; no experimental SDK configuration is required.
++
++`openremote_rev5_windows` is the same firmware with a Windows-compatible
++Bluetooth HID profile (see below). It is opt-in: `pio run` still builds
++`openremote_rev5`.
+ 
+ ## Command-line equivalents
+ 
+@@ -35,3 +39,31 @@ pio run
+ pio run --target upload
+ pio device monitor
+ ```
++
++## Pairing with Windows
++
++The default build presents itself to Chromecast / Android TV. Its HID report
++descriptor declares two top-level collections that share Report ID 1, which
++Android accepts but Windows does not: pairing completes, the link stays up for a
++second, then Windows reports a driver error.
++
++Build and flash the Windows variant instead:
++
++```sh
++pio run -e openremote_rev5_windows --target upload
++```
++
++What it changes, and nothing else:
++
++- One valid keyboard collection (Report ID 1) in place of the two. The report is
++  still 10 bytes, so the Bluetooth service layout is the same as before.
++- Direction keys, OK, Back, Home, volume and mute are sent as standard keyboard
++  keys (arrows, Enter, Esc, Home, Volume Up/Down, Mute) instead of Android
++  Consumer Control "menu" usages. Windows acts on those keys.
++- Play/pause, next/previous and similar media usages are still sent as Consumer
++  Control, as before.
++
++Windows caches a device's report descriptor when it pairs, so after flashing:
++remove the remote under Windows Settings > Bluetooth & devices, choose Forget
++pairing on the remote, then pair again. Otherwise Windows keeps using the old
++descriptor and the same error returns.
+diff --git a/remote/platformio.ini b/remote/platformio.ini
+index 8cba41f..db1a5fa 100644
+--- a/remote/platformio.ini
++++ b/remote/platformio.ini
+@@ -108,3 +108,16 @@ build_flags =
+     -DARDUINOJSON_STRING_LENGTH_SIZE=4
+     -DARDUINOJSON_SLOT_ID_SIZE=4
+     -I.
++
++; Windows Bluetooth build. Identical to openremote_rev5 except for one define,
++; OPENREMOTE_BLE_WINDOWS_HID, which swaps in a HID report descriptor Windows
++; accepts and sends navigation and volume as standard keyboard keys. The default
++; environment above is untouched, so Chromecast / Android TV builds are exactly
++; what they were. See "Pairing with Windows" in PLATFORMIO.md.
++;
++;   pio run -e openremote_rev5_windows --target upload
++[env:openremote_rev5_windows]
++extends = env:openremote_rev5
++build_flags =
++    ${env:openremote_rev5.build_flags}
++    -DOPENREMOTE_BLE_WINDOWS_HID=1
